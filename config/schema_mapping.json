@@ -1,0 +1,29 @@
+{
+    "store_id": [
+        "store", "shop_id", "shop", "branch", "branch_id", "location",
+        "store_code", "storeid", "sid", "location_id", "outlet",
+        "outlet_id", "pharmacy_id", "branch_code", "store_name"
+    ],
+    "product": [
+        "item", "medicine", "drug", "product_name", "sku", "item_name",
+        "med_name", "drug_name", "product_id", "prod", "medication",
+        "medicine_name", "drug_code", "product_code", "item_code",
+        "name", "description", "article"
+    ],
+    "quantity": [
+        "qty", "stock", "count", "amount", "units", "stock_level",
+        "inventory", "avail_qty", "available", "on_hand", "stock_qty",
+        "unit_count", "num_units", "available_qty", "balance", "qty_on_hand"
+    ],
+    "timestamp": [
+        "ts", "time", "date", "updated_at", "update_time", "recorded_at",
+        "datetime", "sync_time", "event_time", "created_at", "modified_at",
+        "report_time", "observation_time", "capture_time", "log_time",
+        "entry_time", "record_time", "last_update"
+    ],
+    "update_id": [
+        "uid", "id", "record_id", "update_num", "version", "revision",
+        "seq_id", "transaction_id", "txn_id", "event_id", "change_id",
+        "row_id", "entry_id", "ref_id", "ref", "identifier"
+    ]
+}

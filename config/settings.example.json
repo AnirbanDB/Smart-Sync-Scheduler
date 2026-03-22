@@ -1,0 +1,23 @@
+{
+    "max_sync_per_window": 5,
+    "conflict_policy": "multi_level",
+    "retry_limit": 3,
+    "scheduling_strategy": "fifo",
+    "default_timezone": "UTC",
+    "app_title": "Pharmacy Smart Sync Scheduler",
+    "app_subtitle": "Queue-based stock synchronisation across pharmacy branches",
+    "idempotency_store_path": "data/processed_ids.json",
+    "log_file": "data/sync.log",
+    "llm": {
+        "enabled": true,
+        "provider": "openai",
+        "endpoint": "https://api.groq.com/openai/v1/chat/completions",
+        "model": "llama-3.1-8b-instant",
+        "api_key": "YOUR_API_KEY_HERE",
+        "timeout": 15,
+        "confidence_threshold": 0.7,
+        "rate_limit_per_minute": 10,
+        "api_retries": 2,
+        "cache_file": "data/llm_cache.json"
+    }
+}
