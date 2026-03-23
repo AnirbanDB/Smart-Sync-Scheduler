@@ -26,6 +26,8 @@ A queue-based stock synchronisation system for multi-branch pharmacy networks. B
 
 ## Overview
 
+![Main Dashboard](assets/dashboard.png)
+
 Pharmacy branches operate on limited server bandwidth. Each branch is allocated short sync windows every few hours during which it can submit stock updates. This system ensures that despite the narrow windows, restricted bandwidth, and the possibility of conflicting or duplicate data, the central stock database remains accurate at all times.
 
 Key guarantees:
@@ -280,6 +282,8 @@ The Sync Schedule tab provides full control over when the server accepts process
 ---
 
 ## Dead Letter Queue
+
+![Dead Letter Queue Management](assets/dead_letter_queue.png)
 
 Records land in the Dead Letter Queue under three conditions:
 
