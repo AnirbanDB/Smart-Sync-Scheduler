@@ -6,30 +6,41 @@ Orchestrates sync windows and maintains the central stock database.
 Key guarantees:
 
   Atomic batch processing (requirement 18):
-    Updates are first written to a deep copy of the database. If all writes
-    succeed, the copy replaces the live database. Any exception triggers a
-    rollback to the original snapshot.
+    Updates are written to a deep copy of the database. On success the copy
+    replaces the live database. Any exception triggers a full rollback.
 
   Idempotency persistence (requirement 19):
     Processed update_ids are saved to a JSON file after every successful
-    batch. On startup, this file is loaded so duplicate processing is
-    prevented even across application restarts.
+    batch so duplicate processing is prevented even across restarts.
 
   Metrics (requirement 20):
-    The engine tracks processed, failed, retried, conflict-dropped, and
-    duplicate-skipped counts, plus a queue-size history for charting.
+    Tracks processed, failed, retried, conflict-dropped, duplicate-skipped,
+    and expired counts, plus a queue-size history for charting.
 
   Out-of-order protection:
-    Before committing an update to the temp database, the engine checks
-    whether the incoming timestamp is older than the currently stored value.
-    Stale records are treated as failures and sent through the retry handler.
+    Before committing, the engine checks whether the incoming timestamp is
+    older than the currently stored value for that store/product pair.
+    Stale records are failed and retried up to the configured limit.
+
+  Sync window integration:
+    run_sync_window accepts a window_label (recorded in the audit log and
+    central database) and a WindowChecker instance. The WindowChecker uses
+    received_at — the server-stamped queue entry time — to identify records
+    that have waited too long and should be expired to the DLQ.
+
+  Two timestamp fields:
+    timestamp   = branch-provided recording time (optional, used for
+                  conflict resolution to determine which stock level is
+                  most recent)
+    received_at = server-stamped queue entry time (always present after
+                  scheduler.enqueue(), used for expiry and audit)
 """
 
 import copy
 import json
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from core.conflict_resolver import ConflictResolver
 from core.logger import get_logger
@@ -55,22 +66,23 @@ class SyncEngine:
         # Central stock database: (store_id, product) -> record dict
         self._database: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
-        # Persistent processed ID set (loaded from disk)
+        # Persistent processed ID set loaded from disk on startup
         self._processed_ids: Set[str] = self._load_processed_ids()
 
         # Audit log of every record that has moved through the engine
         self.processed_records: List[Dict[str, Any]] = []
 
-        # Per-cycle summary
+        # Per-cycle summary entries
         self.sync_cycles: List[Dict[str, Any]] = []
 
-        # Metrics (requirement 20)
+        # Live metrics
         self.metrics: Dict[str, Any] = {
             "total_processed": 0,
             "total_failed": 0,
             "total_retries": 0,
             "total_conflicts": 0,
             "total_duplicates_skipped": 0,
+            "total_expired": 0,
             "queue_size_history": [],
         }
 
@@ -78,27 +90,66 @@ class SyncEngine:
     # Main sync window
     # ------------------------------------------------------------------
 
-    def run_sync_window(self) -> Dict[str, Any]:
+    def run_sync_window(
+        self,
+        window_label: str = "Manual",
+        window_checker=None,
+    ) -> Dict[str, Any]:
         """
         Pull one batch from the queue and apply it atomically.
 
-        Returns a result dict with cycle statistics.
+        Parameters
+        ----------
+        window_label   : Name of the sync window triggering this run.
+                         Written into every processed record and DB entry.
+        window_checker : Optional WindowChecker instance. When provided,
+                         records whose received_at is older than
+                         update_expiry_hours are moved to the dead letter
+                         queue before any processing occurs.
+
+        Returns a result dict with full cycle statistics.
         """
         cycle_num = len(self.sync_cycles) + 1
         run_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-        # Record queue size before dequeue
         self.metrics["queue_size_history"].append(
             {"cycle": cycle_num, "size": self.scheduler.queue_size(), "timestamp": run_ts}
         )
 
         if self.scheduler.is_empty():
-            result = self._empty_cycle_result(cycle_num, run_ts)
+            result = self._empty_cycle_result(cycle_num, run_ts, window_label)
             self.sync_cycles.append(result)
             return result
 
         batch = self.scheduler.dequeue_batch()
-        self.logger.info(f"Cycle {cycle_num}: dequeued {len(batch)} records.")
+        self.logger.info(
+            f"Cycle {cycle_num} [{window_label}]: dequeued {len(batch)} record(s)."
+        )
+
+        # ------------------------------------------------------------------
+        # Stage 0: Expiry check
+        # Records that have been queued too long (based on received_at, the
+        # server-stamped receipt time) go directly to the dead letter queue.
+        # They are not retried because the underlying data is too stale.
+        # ------------------------------------------------------------------
+        expired_count = 0
+        if window_checker is not None:
+            live_batch = []
+            for rec in batch:
+                if window_checker.is_update_expired(rec.get("received_at")):
+                    reason = (
+                        f"Update expired: queued for longer than "
+                        f"{window_checker.expiry_hours:.0f}h without being processed."
+                    )
+                    self.retry_handler.send_to_dead_letter(rec, reason)
+                    expired_count += 1
+                    self.logger.warning(
+                        f"Expired record sent to DLQ: update_id={rec.get('update_id')}, "
+                        f"received_at={rec.get('received_at')}"
+                    )
+                else:
+                    live_batch.append(rec)
+            batch = live_batch
 
         # Stage 1: Idempotency filter
         fresh_records, duplicate_ids = self._filter_duplicates(batch)
@@ -109,7 +160,6 @@ class SyncEngine:
         resolved_records, conflicts_dropped = self.resolver.resolve(fresh_records)
         self.metrics["total_conflicts"] += conflicts_dropped
 
-        # Build ID sets for fast status lookup when archiving
         resolved_ids = {str(r.get("update_id", "")) for r in resolved_records}
         conflict_dropped_ids = (
             {str(r.get("update_id", "")) for r in fresh_records} - resolved_ids
@@ -117,33 +167,31 @@ class SyncEngine:
 
         # Stage 3: Atomic apply
         applied_records, failed_records, failed_with_reasons = self._atomic_apply(
-            resolved_records, cycle_num, run_ts
+            resolved_records, cycle_num, run_ts, window_label
         )
         applied_ids = {str(r.get("update_id", "")) for r in applied_records}
-        failed_ids = {str(r.get("update_id", "")) for r in failed_records}
+        failed_ids  = {str(r.get("update_id", "")) for r in failed_records}
 
-        # Update persistent processed IDs
         for rec in applied_records:
             uid = str(rec.get("update_id", ""))
             if uid:
                 self._processed_ids.add(uid)
         self._save_processed_ids()
 
-        # Update metrics
         self.metrics["total_processed"] += len(applied_records)
-        self.metrics["total_failed"] += len(failed_records)
+        self.metrics["total_failed"]    += len(failed_records)
+        self.metrics["total_expired"]   += expired_count
 
-        # Archive every record with its final status
         self._archive_batch(
             batch=batch,
             cycle_num=cycle_num,
+            window_label=window_label,
             applied_ids=applied_ids,
             failed_ids=failed_ids,
             duplicate_ids=duplicate_ids,
             conflict_dropped_ids=conflict_dropped_ids,
         )
 
-        # Retry failed records
         requeued = self._handle_retries(failed_with_reasons)
         self.metrics["total_retries"] += requeued
 
@@ -151,18 +199,21 @@ class SyncEngine:
             "status": "ok",
             "cycle_number": cycle_num,
             "timestamp": run_ts,
+            "window_label": window_label,
             "fetched": len(batch),
             "applied": len(applied_records),
             "conflicts": conflicts_dropped,
             "duplicates": duplicates_skipped,
+            "expired": expired_count,
             "failed": len(failed_records),
             "retried": requeued,
             "applied_records": applied_records,
         }
         self.sync_cycles.append(result)
         self.logger.info(
-            f"Cycle {cycle_num} done: applied={len(applied_records)}, "
-            f"conflicts={conflicts_dropped}, failed={len(failed_records)}, "
+            f"Cycle {cycle_num} [{window_label}] done: "
+            f"applied={len(applied_records)}, conflicts={conflicts_dropped}, "
+            f"expired={expired_count}, failed={len(failed_records)}, "
             f"retried={requeued}."
         )
         return result
@@ -176,57 +227,78 @@ class SyncEngine:
         records: List[Dict[str, Any]],
         cycle_num: int,
         run_ts: str,
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        window_label: str = "Manual",
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List]:
         """
-        Apply records to a temporary copy of the database.
-        On success: replace live DB with the temp copy.
-        On exception: discard temp copy, preserve original state.
+        Write records to a temporary copy of the database.
+        On success: replace live DB. On any exception: rollback to snapshot.
+
+        Conflict resolution within the central database:
+          The engine uses the record's timestamp field (branch recording time)
+          when present for out-of-order detection, because that field represents
+          the actual recency of the stock information. If timestamp is absent,
+          received_at is used as a fallback so the system still rejects stale
+          re-submissions of the same record.
         """
         db_snapshot = copy.deepcopy(self._database)
-        temp_db = copy.deepcopy(self._database)
+        temp_db     = copy.deepcopy(self._database)
         applied: List[Dict[str, Any]] = []
-        # Each entry is (record, failure_reason_string)
         failed_with_reasons: List[Tuple[Dict[str, Any], str]] = []
 
         try:
             for rec in records:
-                key = (str(rec.get("store_id", "")), str(rec.get("product", "")))
+                key      = (str(rec.get("store_id", "")), str(rec.get("product", "")))
                 db_entry = temp_db.get(key)
 
-                # Out-of-order check: reject stale data
-                if db_entry and self.resolver.check_out_of_order(rec, db_entry):
-                    db_ts = db_entry.get("last_updated", "")
-                    rec_ts = rec.get("timestamp", "")
-                    db_ts_str = db_ts.isoformat(timespec="seconds") if hasattr(db_ts, "isoformat") else str(db_ts)
-                    rec_ts_str = rec_ts.isoformat(timespec="seconds") if hasattr(rec_ts, "isoformat") else str(rec_ts)
-                    reason = f"Stale update (record: {rec_ts_str} < db: {db_ts_str})"
-                    self.logger.warning(
-                        f"Out-of-order update ignored: update_id={rec.get('update_id')}. "
-                        f"{reason}"
-                    )
-                    failed_with_reasons.append((rec, reason))
-                    continue
+                # Out-of-order check:
+                # Prefer timestamp (branch recording time) for comparison.
+                # Fall back to received_at if timestamp is absent.
+                if db_entry:
+                    incoming_ts = rec.get("timestamp") or rec.get("received_at")
+                    if incoming_ts is not None and self.resolver.check_out_of_order(
+                        {"timestamp": incoming_ts}, db_entry
+                    ):
+                        db_ts  = db_entry.get("last_updated", "")
+                        rec_ts = incoming_ts
+                        db_ts_str  = db_ts.isoformat(timespec="seconds")  if hasattr(db_ts,  "isoformat") else str(db_ts)
+                        rec_ts_str = rec_ts.isoformat(timespec="seconds") if hasattr(rec_ts, "isoformat") else str(rec_ts)
+                        reason = (
+                            f"Stale update (record: {rec_ts_str} < db: {db_ts_str})"
+                        )
+                        self.logger.warning(
+                            f"Out-of-order update ignored: "
+                            f"update_id={rec.get('update_id')}. {reason}"
+                        )
+                        failed_with_reasons.append((rec, reason))
+                        continue
 
+                # Store both the branch timestamp and the server receipt time
+                # so the full audit trail is preserved.
                 temp_db[key] = {
-                    "store_id": rec.get("store_id"),
-                    "product": rec.get("product"),
-                    "quantity": rec.get("quantity"),
-                    "last_updated": rec.get("timestamp"),
-                    "update_id": rec.get("update_id"),
-                    "synced_at": run_ts,
-                    "sync_cycle": cycle_num,
+                    "store_id":    rec.get("store_id"),
+                    "product":     rec.get("product"),
+                    "quantity":    rec.get("quantity"),
+                    "timestamp":   rec.get("timestamp"),
+                    "received_at": rec.get("received_at"),
+                    "last_updated": rec.get("timestamp") or rec.get("received_at"),
+                    "update_id":   rec.get("update_id"),
+                    "synced_at":   run_ts,
+                    "sync_cycle":  cycle_num,
+                    "sync_window": window_label,
                 }
                 applied.append(rec)
 
-            # Commit: replace live database with temp copy
             self._database = temp_db
-            self.logger.info(f"Atomic commit: {len(applied)} record(s) written.")
+            self.logger.info(
+                f"Atomic commit: {len(applied)} record(s) written to database."
+            )
 
         except Exception as exc:
-            # Rollback: restore snapshot
             self._database = db_snapshot
             self.logger.error(f"Atomic batch failed, rolling back: {exc}")
-            failed_with_reasons = [(r, f"Processing error: {str(exc)[:60]}") for r in records]
+            failed_with_reasons = [
+                (r, f"Processing error: {str(exc)[:60]}") for r in records
+            ]
             applied = []
 
         failed_records = [r for r, _ in failed_with_reasons]
@@ -278,7 +350,9 @@ class SyncEngine:
     # Retry handling
     # ------------------------------------------------------------------
 
-    def _handle_retries(self, failed_with_reasons: List[Tuple[Dict[str, Any], str]]) -> int:
+    def _handle_retries(
+        self, failed_with_reasons: List[Tuple[Dict[str, Any], str]]
+    ) -> int:
         requeued = 0
         for rec, reason in failed_with_reasons:
             uid = str(rec.get("update_id", ""))
@@ -290,7 +364,6 @@ class SyncEngine:
                     f"Requeued update_id={uid} for retry #{count}. Reason: {reason}"
                 )
             else:
-                # Build a final DLQ reason that includes both root cause and retry count
                 self.retry_handler.send_to_dead_letter(rec, reason)
         return requeued
 
@@ -302,6 +375,7 @@ class SyncEngine:
         self,
         batch: List[Dict[str, Any]],
         cycle_num: int,
+        window_label: str,
         applied_ids: Set[str],
         failed_ids: Set[str],
         duplicate_ids: Set[str],
@@ -310,7 +384,8 @@ class SyncEngine:
         for rec in batch:
             uid = str(rec.get("update_id", ""))
             archived = dict(rec)
-            archived["sync_cycle"] = cycle_num
+            archived["sync_cycle"]  = cycle_num
+            archived["sync_window"] = window_label
 
             if uid in applied_ids:
                 archived["sync_status"] = "applied"
@@ -344,8 +419,8 @@ class SyncEngine:
 
     def reset(self) -> None:
         """
-        Clear in-session state. Does NOT clear the idempotency store on disk,
-        so processed IDs remain durable across session resets (requirement 19).
+        Clear all in-session state. The idempotency store on disk is
+        preserved so processed IDs remain durable across manual resets.
         """
         self._database.clear()
         self.processed_records.clear()
@@ -358,6 +433,7 @@ class SyncEngine:
             "total_retries": 0,
             "total_conflicts": 0,
             "total_duplicates_skipped": 0,
+            "total_expired": 0,
             "queue_size_history": [],
         }
 
@@ -366,15 +442,21 @@ class SyncEngine:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _empty_cycle_result(cycle_num: int, run_ts: str) -> Dict[str, Any]:
+    def _empty_cycle_result(
+        cycle_num: int,
+        run_ts: str,
+        window_label: str = "Manual",
+    ) -> Dict[str, Any]:
         return {
             "status": "empty",
             "cycle_number": cycle_num,
             "timestamp": run_ts,
+            "window_label": window_label,
             "fetched": 0,
             "applied": 0,
             "conflicts": 0,
             "duplicates": 0,
+            "expired": 0,
             "failed": 0,
             "retried": 0,
             "applied_records": [],

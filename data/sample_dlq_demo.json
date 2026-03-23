@@ -4,73 +4,57 @@
             "branch": "S001",
             "medicine": "Paracetamol 500mg",
             "qty": 105,
-            "id": "UID-J01"
+            "recorded_at": "2024-01-15T08:20:00+05:30",
+            "id": "DLQ-J01"
         },
         {
             "branch": "S001",
             "medicine": "Amoxicillin 250mg",
             "qty": 35,
-            "id": "UID-J02"
+            "recorded_at": "2024-01-15T09:05:00+05:30",
+            "id": "DLQ-J02"
         },
         {
             "branch": "S002",
             "medicine": "Ibuprofen 400mg",
             "qty": 60,
-            "id": "UID-J03"
+            "recorded_at": "2024-01-15T10:00:00+05:30",
+            "id": "DLQ-J03"
         },
         {
             "branch": "S002",
             "medicine": "Metformin 500mg",
             "qty": 115,
-            "id": "UID-J04"
+            "recorded_at": "2024-01-15T11:00:00+05:30",
+            "id": "DLQ-J04"
         },
         {
             "branch": "S003",
             "medicine": "Aspirin 100mg",
             "qty": 210,
-            "id": "UID-J05"
+            "recorded_at": "2024-01-15T12:00:00+05:30",
+            "id": "DLQ-J05"
         },
         {
             "branch": "S003",
             "medicine": "Paracetamol 500mg",
             "qty": 165,
-            "id": "UID-J06"
+            "recorded_at": "2024-01-15T13:00:00+05:30",
+            "id": "DLQ-J06"
         },
         {
             "branch": "S004",
             "medicine": "Amoxicillin 250mg",
             "qty": 28,
-            "id": "UID-J07"
+            "recorded_at": "2024-01-15T14:00:00+05:30",
+            "id": "DLQ-J07"
         },
         {
             "branch": "S004",
             "medicine": "Ibuprofen 400mg",
             "qty": 140,
-            "id": "UID-J08"
-        },
-        {
-            "branch": "S001",
-            "medicine": "Metformin 500mg",
-            "qty": 75,
-            "id": "UID-J09"
-        },
-        {
-            "branch": "S002",
-            "medicine": "Aspirin 100mg",
-            "qty": 98,
-            "id": "UID-J10"
-        },
-        {
-            "branch": "S003",
-            "medicine": "Ibuprofen 400mg",
-            "qty": "not-a-number",
-            "id": "UID-J11"
-        },
-        {
-            "branch": "",
-            "medicine": "Metformin 500mg",
-            "qty": 220,
-            "id": "UID-J12"
+            "recorded_at": "2024-01-15T15:00:00+05:30",
+            "id": "DLQ-J08"
         }
     ]
 }

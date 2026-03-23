@@ -14,6 +14,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import pandas as pd
 import plotly.graph_objects as go
+from streamlit_autorefresh import st_autorefresh
+
 import streamlit as st
 
 from core.conflict_resolver import ConflictResolver
@@ -127,12 +129,19 @@ def _init_session() -> None:
         logger=logger,
     )
 
+    # Window checker — reads sync_schedule from settings
+    from core.window_checker import WindowChecker
+    schedule_cfg = settings.get("sync_schedule", {})
+    window_checker = WindowChecker(schedule_cfg, logger=logger)
+
     st.session_state.settings = settings
     st.session_state.logger = logger
     st.session_state.scheduler = scheduler
     st.session_state.resolver = resolver
     st.session_state.retry_handler = retry_handler
     st.session_state.engine = engine
+    st.session_state.window_checker = window_checker
+    st.session_state.emergency_override = False
 
     # Upload pipeline state
     st.session_state.raw_df = None
@@ -147,6 +156,8 @@ def _init_session() -> None:
 
     # Session-level counter for total enqueued
     st.session_state.total_enqueued = 0
+    st.session_state.upload_error = ""
+    st.session_state.last_uploaded_identity = None
 
     # Notifications buffer
     st.session_state.notifications = []
@@ -162,6 +173,20 @@ scheduler: SyncScheduler = st.session_state.scheduler
 retry_handler: RetryHandler = st.session_state.retry_handler
 settings: dict = st.session_state.settings
 logger = st.session_state.logger
+
+# Rebuild window_checker on every rerun so schedule changes in the UI
+# take effect immediately without restarting the app.
+from core.window_checker import WindowChecker as _WC, save_schedule_config, validate_window_entry
+from core.llm_mapper import clear_mapping_cache as _clear_llm_cache
+_schedule_cfg = settings.get("sync_schedule", {})
+window_checker = _WC(_schedule_cfg, logger=logger)
+st.session_state.window_checker = window_checker
+
+# Trigger a genuine browser-initiated rerun every 10 seconds so the
+# sync window countdown, queue metrics and sidebar numbers stay live.
+# st_autorefresh injects a JS timer — it does NOT call st.rerun() at
+# module level on first render, so it cannot interrupt file processing.
+st_autorefresh(interval=10_000, limit=None, key="global_autorefresh")
 
 
 # ---------------------------------------------------------------------------
@@ -180,9 +205,41 @@ with st.sidebar:
     cfg3, cfg4 = st.columns(2)
     cfg3.metric("Conflict Policy", settings.get("conflict_policy", "multi_level").replace("_", " ").title())
     cfg4.metric("Retry Limit", settings.get("retry_limit", 3))
-    llm_status = "On" if settings.get("llm", {}).get("enabled", False) else "Off"
-    st.caption(f"Default TZ: {settings.get('default_timezone', 'UTC')}  |  LLM: {llm_status}")
-    st.caption("Edit `config/settings.json` then restart to change configuration.")
+    st.caption(f"Default TZ: {settings.get('default_timezone', 'UTC')}")
+
+    llm_cfg = settings.get("llm", {})
+    llm_currently_on = llm_cfg.get("enabled", False)
+    llm_toggle = st.toggle(
+        "LLM semantic mapping",
+        value=llm_currently_on,
+        help=(
+            "When on, columns that rule-based matching cannot identify are sent "
+            "to the configured LLM endpoint for semantic inference. "
+            "Requires a valid endpoint and API key in config/settings.json."
+        ),
+    )
+    if llm_toggle != llm_currently_on:
+        llm_cfg["enabled"] = llm_toggle
+        settings["llm"] = llm_cfg
+        st.session_state.settings = settings
+        try:
+            import json as _json
+            cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "settings.json")
+            with open(cfg_path, "r", encoding="utf-8") as _fh:
+                _disk = _json.load(_fh)
+            _disk["llm"] = llm_cfg
+            with open(cfg_path, "w", encoding="utf-8") as _fh:
+                _json.dump(_disk, _fh, indent=4)
+        except Exception:
+            pass
+        # Flush both RAM and disk LLM cache so a previously bad or
+        # partial mapping cannot be reloaded from disk after the toggle.
+        _clear_llm_cache(
+            settings.get("llm", {}).get("cache_file", "data/llm_cache.json")
+        )
+        st.session_state.last_uploaded_identity = None
+        st.rerun()
+    st.caption("Edit config/settings.json for endpoint and API key settings.")
     st.divider()
 
     st.markdown("**Session Summary**")
@@ -207,6 +264,8 @@ with st.sidebar:
             st.session_state.validation_warnings = []
             st.session_state.ready_to_enqueue = False
             st.session_state.notifications = []
+            st.session_state.upload_error = ""
+            st.session_state.last_uploaded_identity = None
             st.rerun()
 
 
@@ -230,6 +289,7 @@ st.session_state.notifications.clear()
     tab_history,
     tab_database,
     tab_dlq,
+    tab_schedule,
 ) = st.tabs([
     "Upload and Normalize",
     "Dashboard",
@@ -237,6 +297,7 @@ st.session_state.notifications.clear()
     "Sync History",
     "Central Database",
     "Dead Letter Queue",
+    "Sync Schedule",
 ])
 
 
@@ -247,9 +308,10 @@ st.session_state.notifications.clear()
 with tab_upload:
     st.markdown("### Upload Stock Update File")
     st.caption(
-        "Upload a CSV, XLSX, or JSON file. Column names are automatically mapped to "
-        "the standard schema using rule-based matching (and optionally LLM inference). "
-        "Valid records are added to the sync queue."
+        "Upload a CSV, XLSX, or JSON file. Required columns: store_id, product, quantity. "
+        "update_id is optional — auto-generated if absent. "
+        "timestamp is optional — if omitted the server records the upload time automatically. "
+        "Column names are mapped using rule-based matching (and optionally LLM inference)."
     )
 
     uploaded_file = st.file_uploader(
@@ -258,160 +320,363 @@ with tab_upload:
         help="Accepted formats: CSV, XLSX, XLS, JSON",
     )
 
+    # -------------------------------------------------------------------
+    # Processing gate.
+    #
+    # Identity is (filename, file size in bytes).  Using size alongside
+    # name means re-uploading a different file with the same name still
+    # triggers a full re-process, while auto-refresh reruns (where
+    # uploaded_file is the same object) are correctly skipped.
+    #
+    # All results land in session state and survive every subsequent
+    # rerun (including the 10-second autorefresh) without re-processing.
+    # -------------------------------------------------------------------
     if uploaded_file is not None:
-        # Load raw file
-        with st.spinner("Loading file..."):
-            try:
-                raw_df, file_info = load_file(
-                    uploaded_file, uploaded_file.name, logger=logger
-                )
-                st.session_state.raw_df = raw_df
-                st.session_state.file_info = file_info
-                st.session_state.ready_to_enqueue = False
-            except Exception as exc:
-                st.error(f"Could not load file: {exc}")
-                st.stop()
+        file_identity = (uploaded_file.name, uploaded_file.size)
+        last_identity = st.session_state.get("last_uploaded_identity")
 
+        if file_identity != last_identity:
+            # Clear all downstream state from any previous file
+            st.session_state.raw_df = None
+            st.session_state.normalized_df = None
+            st.session_state.file_info = {}
+            st.session_state.mapping_result = {}
+            st.session_state.mapping_sources = {}
+            st.session_state.llm_confidence = None
+            st.session_state.llm_reason = ""
+            st.session_state.validation_warnings = []
+            st.session_state.ready_to_enqueue = False
+            st.session_state.upload_error = ""
+            st.session_state.last_uploaded_identity = file_identity
+
+            # Step 1 — load raw file into DataFrame
+            with st.spinner("Loading file..."):
+                try:
+                    raw_df, file_info = load_file(
+                        uploaded_file, uploaded_file.name, logger=logger
+                    )
+                    st.session_state.raw_df = raw_df
+                    st.session_state.file_info = file_info
+                except Exception as exc:
+                    st.session_state.upload_error = f"Could not load file: {exc}"
+                    logger.error(f"File load failed: {exc}")
+
+            if not st.session_state.upload_error and st.session_state.raw_df is not None:
+                raw_df = st.session_state.raw_df
+                rules = load_mapping_rules("config/schema_mapping.json")
+                original_columns = list(raw_df.columns)
+
+                # Step 2 — rule-based schema mapping
+                rule_mapping, unmapped = rule_based_map(
+                    original_columns, rules, logger=logger
+                )
+                combined_mapping: dict = dict(rule_mapping)
+                mapping_sources: dict = {col: "rule-based" for col in rule_mapping}
+
+                # Step 3 — LLM mapping for any columns still unmapped
+                llm_conf = None
+                llm_reason = ""
+                if unmapped:
+                    llm_config = settings.get("llm", {})
+                    if llm_config.get("enabled", False):
+                        with st.spinner("Calling LLM for semantic column mapping..."):
+                            llm_map, llm_conf, llm_reason = llm_map_columns(
+                                original_columns, llm_config, combined_mapping,
+                                logger=logger
+                            )
+                        if llm_map:
+                            for col, field in llm_map.items():
+                                if col not in combined_mapping:
+                                    combined_mapping[col] = field
+                                    mapping_sources[col] = "llm"
+                    else:
+                        llm_reason = (
+                            "LLM is disabled. Enable it in config/settings.json "
+                            "for semantic fallback mapping."
+                        )
+
+                st.session_state.mapping_result = combined_mapping
+                st.session_state.mapping_sources = mapping_sources
+                st.session_state.llm_confidence = llm_conf
+                st.session_state.llm_reason = llm_reason
+
+                # Step 4 — validate only when all required fields are covered
+                mapped_standards = set(combined_mapping.values())
+                missing_required = {"store_id", "product", "quantity"} - mapped_standards
+
+                if not missing_required:
+                    mapped_df = apply_mapping(raw_df, combined_mapping)
+                    with st.spinner("Validating and normalising data..."):
+                        try:
+                            normalized_df, val_warnings = validate_and_normalize(
+                                mapped_df,
+                                default_timezone=settings.get("default_timezone", "UTC"),
+                                logger=logger,
+                            )
+                            st.session_state.normalized_df = normalized_df
+                            st.session_state.validation_warnings = val_warnings
+                            st.session_state.ready_to_enqueue = len(normalized_df) > 0
+                        except ValueError as exc:
+                            st.session_state.upload_error = str(exc)
+                            st.session_state.ready_to_enqueue = False
+
+    # -------------------------------------------------------------------
+    # Display section: renders entirely from session state so it remains
+    # visible across every auto-refresh rerun, not just the upload rerun.
+    # -------------------------------------------------------------------
+
+    if st.session_state.get("upload_error"):
+        st.error(st.session_state.upload_error)
+
+    elif st.session_state.raw_df is not None:
         fi = st.session_state.file_info
+        raw_df = st.session_state.raw_df
+        combined_mapping = st.session_state.mapping_result
+        mapping_sources = st.session_state.mapping_sources
+        llm_conf = st.session_state.llm_confidence
+        llm_reason = st.session_state.llm_reason
+
+        # File summary banner
         st.info(
             f"File: **{fi['name']}**  |  Format: {fi['format'].upper()}  |  "
-            f"Rows: {fi['rows']}  |  Columns detected: {len(fi['columns'])}"
+            f"Rows loaded: **{fi['rows']}**  |  Columns detected: **{len(fi['columns'])}**  |  "
+            f"Server stamps received_at on enqueue."
         )
 
-        # --- Schema Mapping ---
+        # ---- Schema mapping results ----
         st.markdown('<p class="section-title">Schema Mapping</p>', unsafe_allow_html=True)
 
-        rules = load_mapping_rules("config/schema_mapping.json")
-        original_columns = list(raw_df.columns)
-
-        # Rule-based pass
-        rule_mapping, unmapped = rule_based_map(original_columns, rules, logger=logger)
-        combined_mapping: dict = dict(rule_mapping)
-        mapping_sources: dict = {col: "rule-based" for col in rule_mapping}
-
-        # LLM pass (if enabled and columns remain unmapped)
-        llm_used = False
-        llm_conf = None
-        llm_reason = ""
-
-        if unmapped:
-            llm_config = settings.get("llm", {})
-            if llm_config.get("enabled", False):
-                with st.spinner("Calling LLM for semantic column mapping..."):
-                    llm_map, llm_conf, llm_reason = llm_map_columns(
-                        original_columns, llm_config, combined_mapping, logger=logger
-                    )
-                if llm_map:
-                    for col, field in llm_map.items():
-                        if col not in combined_mapping:
-                            combined_mapping[col] = field
-                            mapping_sources[col] = "llm"
-                    llm_used = True
-            else:
-                llm_reason = "LLM is disabled. Enable it in config/settings.json."
-
-        st.session_state.mapping_result = combined_mapping
-        st.session_state.mapping_sources = mapping_sources
-        st.session_state.llm_confidence = llm_conf
-        st.session_state.llm_reason = llm_reason
-
-        # Display mapping table
         map_df = mapping_to_df(combined_mapping, mapping_sources)
         if not map_df.empty:
             st.dataframe(map_df, use_container_width=True, hide_index=True)
         else:
-            st.warning("No columns could be mapped. Check that the file has recognisable column names.")
-
-        # Unmapped columns warning
-        still_unmapped = [c for c in original_columns if c not in combined_mapping]
-        if still_unmapped:
             st.warning(
-                f"Unmapped columns (will be dropped): {', '.join(still_unmapped)}"
+                "No columns could be mapped. Check that the file contains "
+                "recognisable column names."
             )
 
-        # LLM status line
-        if llm_used:
-            st.caption(
-                f"LLM mapping applied. Confidence: {llm_conf:.2f}  |  {llm_reason}"
+        still_unmapped = [c for c in fi["columns"] if c not in combined_mapping]
+        if still_unmapped:
+            st.warning(f"Unmapped columns (will be dropped): {', '.join(still_unmapped)}")
+
+        llm_enabled = settings.get("llm", {}).get("enabled", False)
+        still_unmapped_after_llm = [c for c in fi["columns"] if c not in combined_mapping]
+
+        if llm_conf is not None:
+            st.success(
+                f"LLM semantic mapping applied  |  Confidence: {llm_conf:.2f}  |  {llm_reason}"
             )
-        elif settings.get("llm", {}).get("enabled", False):
-            st.caption(f"LLM result: {llm_reason}")
+        elif llm_enabled and not still_unmapped_after_llm:
+            st.caption(f"LLM ran but all columns were already covered by rule-based mapping.")
+        elif llm_enabled:
+            st.caption(f"LLM ran  |  {llm_reason}")
+        elif still_unmapped:
+            # LLM is off and there are unmapped columns — show an actionable warning
+            st.warning(
+                f"{len(still_unmapped)} column(s) could not be mapped by rule-based matching "
+                f"({', '.join(still_unmapped)}). "
+                "Turn on **LLM semantic mapping** in the sidebar to attempt automatic inference, "
+                "then the file will be re-processed immediately."
+            )
         else:
-            st.caption("LLM is off. Only rule-based mapping was applied.")
+            st.caption("Rule-based mapping resolved all columns. LLM was not needed.")
 
-        # Check required fields are covered
+        # ---- Required-field coverage check ----
         mapped_standards = set(combined_mapping.values())
-        missing_required = REQUIRED_FIELDS - mapped_standards
+        truly_required = {"store_id", "product", "quantity"}
+        missing_required = truly_required - mapped_standards
+
         if missing_required:
+            found_cols = fi["columns"]
             st.error(
-                f"Required fields could not be mapped: {', '.join(sorted(missing_required))}. "
-                "Cannot proceed. Rename columns or enable LLM mapping."
+                f"Required fields still missing after mapping: "
+                f"**{', '.join(sorted(missing_required))}**. "
+                f"Columns found in this file: {', '.join(found_cols)}. "
+                f"The system needs at minimum: store_id (or equivalent), "
+                f"product (or equivalent), quantity (or equivalent). "
+                + (
+                    "Enable LLM semantic mapping in the sidebar — it may be able to "
+                    "infer the correct mapping from your column names."
+                    if not llm_enabled else
+                    "LLM mapping ran but could not resolve the required fields. "
+                    "This file may not be a pharmacy stock update file."
+                )
             )
+
         else:
-            # --- Apply mapping and validate ---
-            mapped_df = apply_mapping(raw_df, combined_mapping)
-
-            with st.spinner("Validating and normalising data..."):
-                try:
-                    normalized_df, warnings = validate_and_normalize(
-                        mapped_df,
-                        default_timezone=settings.get("default_timezone", "UTC"),
-                        logger=logger,
-                    )
-                    st.session_state.normalized_df = normalized_df
-                    st.session_state.validation_warnings = warnings
-                    st.session_state.ready_to_enqueue = len(normalized_df) > 0
-                except ValueError as exc:
-                    st.error(str(exc))
-                    st.session_state.ready_to_enqueue = False
-
-            # Show validation results
-            st.markdown('<p class="section-title">Validation Results</p>', unsafe_allow_html=True)
+            # ---- Validation results ----
+            st.markdown(
+                '<p class="section-title">Validation Results</p>', unsafe_allow_html=True
+            )
 
             for w in st.session_state.validation_warnings:
                 st.warning(w)
 
-            if st.session_state.ready_to_enqueue:
-                ndf = st.session_state.normalized_df
+            normalized_df = st.session_state.normalized_df
+            n_valid = len(normalized_df) if normalized_df is not None else 0
+            n_dropped = fi["rows"] - n_valid
+
+            if n_valid > 0:
+                count_c1, count_c2, count_c3, count_c4 = st.columns(4)
+                count_c1.metric("Rows loaded", fi["rows"])
+                count_c2.metric("Valid rows", n_valid)
+                count_c3.metric("Rows dropped", n_dropped)
+                count_c4.metric("Columns mapped", len(combined_mapping))
+
                 st.success(
-                    f"{len(ndf)} valid row(s) ready. "
-                    f"{len(raw_df) - len(ndf)} row(s) dropped during validation."
+                    f"{n_valid} valid row(s) ready to enqueue. "
+                    f"{n_dropped} row(s) dropped during validation."
                 )
 
-        # --- Data preview panels ---
-        col_raw, col_norm = st.columns(2)
-
-        with col_raw:
-            st.markdown('<p class="section-title">Raw Uploaded Data</p>', unsafe_allow_html=True)
-            st.dataframe(raw_df.head(50), use_container_width=True, hide_index=True)
-            if len(raw_df) > 50:
-                st.caption(f"Showing first 50 of {len(raw_df)} rows.")
-
-        with col_norm:
-            st.markdown('<p class="section-title">Normalised Data (UTC timestamps)</p>', unsafe_allow_html=True)
-            if st.session_state.normalized_df is not None and not st.session_state.normalized_df.empty:
-                display_df = records_to_df(
-                    st.session_state.normalized_df.to_dict("records")
+                # ---- Conflict pre-analysis ----
+                # Show the user what conflict resolution will do before
+                # records hit the sync engine, so they can inspect the
+                # data before committing it to the queue.
+                st.markdown(
+                    '<p class="section-title">Conflict Pre-Analysis</p>',
+                    unsafe_allow_html=True,
                 )
-                st.dataframe(display_df.head(50), use_container_width=True, hide_index=True)
-                if len(display_df) > 50:
-                    st.caption(f"Showing first 50 of {len(display_df)} rows.")
+                st.caption(
+                    "Two records conflict when they target the same (store, product) pair. "
+                    "The sync engine resolves conflicts using three levels: "
+                    "1) latest timestamp wins, "
+                    "2) on equal timestamps the lexicographically higher update_id wins, "
+                    "3) on equal update_ids the last record in arrival order wins. "
+                    "Duplicate update_ids are dropped before conflict resolution runs."
+                )
+
+                if normalized_df is not None and not normalized_df.empty:
+                    # Identify duplicate update_ids within this file
+                    uid_counts = normalized_df["update_id"].value_counts()
+                    duplicate_uids = uid_counts[uid_counts > 1].index.tolist()
+                    n_duplicate_uids = len(duplicate_uids)
+
+                    # Identify conflicting (store, product) pairs
+                    pair_counts = normalized_df.groupby(
+                        ["store_id", "product"]
+                    ).size().reset_index(name="record_count")
+                    conflicting_pairs = pair_counts[pair_counts["record_count"] > 1]
+                    n_conflicts = len(conflicting_pairs)
+                    n_conflict_records = int(
+                        conflicting_pairs["record_count"].sum()
+                    ) if n_conflicts > 0 else 0
+                    n_conflict_will_drop = n_conflict_records - n_conflicts
+
+                    ca1, ca2, ca3, ca4 = st.columns(4)
+                    ca1.metric(
+                        "Unique (store, product) pairs",
+                        int(pair_counts["record_count"].gt(0).sum()),
+                    )
+                    ca2.metric(
+                        "Conflicting pairs",
+                        n_conflicts,
+                        help="Same store + product appears more than once in this file.",
+                    )
+                    ca3.metric(
+                        "Records that will be dropped by conflict resolution",
+                        n_conflict_will_drop,
+                    )
+                    ca4.metric(
+                        "Duplicate update_ids in this file",
+                        n_duplicate_uids,
+                        help="These are deduplicated before conflict resolution.",
+                    )
+
+                    if n_conflicts > 0:
+                        with st.expander(
+                            f"View {n_conflicts} conflicting (store, product) pair(s)"
+                        ):
+                            conflict_detail = conflicting_pairs.rename(columns={
+                                "store_id": "Store",
+                                "product": "Product",
+                                "record_count": "Submissions in this file",
+                            })
+                            st.dataframe(
+                                conflict_detail,
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                            st.caption(
+                                "The sync engine will keep exactly one record per pair "
+                                "using the resolution levels described above."
+                            )
+
+                    if n_duplicate_uids > 0:
+                        with st.expander(f"View {n_duplicate_uids} duplicate update_id(s)"):
+                            dup_detail = (
+                                normalized_df[normalized_df["update_id"].isin(duplicate_uids)]
+                                [["update_id", "store_id", "product", "quantity"]]
+                                .sort_values("update_id")
+                            )
+                            st.dataframe(
+                                dup_detail,
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                            st.caption(
+                                "Only the last occurrence of each duplicate update_id "
+                                "survives into conflict resolution."
+                            )
+
             else:
-                st.info("Normalised data will appear here after mapping.")
+                st.error("No valid rows remain after validation. Check the warnings above.")
 
-        # --- Add to queue ---
-        st.divider()
-        if st.session_state.ready_to_enqueue:
-            if st.button("Add to Queue", type="primary", use_container_width=False):
-                records = st.session_state.normalized_df.to_dict("records")
-                added = scheduler.enqueue(records)
-                st.session_state.total_enqueued += added
-                st.session_state.notifications.append(
-                    f"Added {added} record(s) to the sync queue."
+            # ---- Data preview panels ----
+            st.divider()
+            col_raw, col_norm = st.columns(2)
+
+            with col_raw:
+                st.markdown(
+                    '<p class="section-title">Raw Uploaded Data</p>',
+                    unsafe_allow_html=True,
                 )
-                st.rerun()
-        else:
-            st.info("Upload a valid file to enable the queue button.")
+                st.dataframe(raw_df.head(50), use_container_width=True, hide_index=True)
+                if len(raw_df) > 50:
+                    st.caption(f"Showing first 50 of {len(raw_df)} rows.")
+
+            with col_norm:
+                st.markdown(
+                    '<p class="section-title">Normalised Data</p>',
+                    unsafe_allow_html=True,
+                )
+                st.caption("received_at is stamped by the server at queue entry — not shown here.")
+                if normalized_df is not None and not normalized_df.empty:
+                    display_df = records_to_df(normalized_df.to_dict("records"))
+                    st.dataframe(display_df.head(50), use_container_width=True, hide_index=True)
+                    if len(display_df) > 50:
+                        st.caption(f"Showing first 50 of {len(display_df)} rows.")
+                else:
+                    st.info("No valid rows to display.")
+
+            # ---- Add to queue ----
+            st.divider()
+            if st.session_state.ready_to_enqueue:
+                enqueue_col, info_col = st.columns([2, 5])
+                with enqueue_col:
+                    if st.button("Add to Queue", type="primary", use_container_width=True):
+                        records = st.session_state.normalized_df.to_dict("records")
+                        added = scheduler.enqueue(records)
+                        st.session_state.total_enqueued += added
+                        # Mark as enqueued so the button cannot be pressed twice
+                        st.session_state.ready_to_enqueue = False
+                        st.session_state.notifications.append(
+                            f"Added {added} record(s) to the sync queue."
+                        )
+                        st.rerun()
+                with info_col:
+                    st.info(
+                        f"{n_valid} record(s) will be added. "
+                        f"Current queue size: {scheduler.queue_size()}."
+                    )
+            else:
+                if st.session_state.file_info:
+                    st.info(
+                        "Records from this file have already been added to the queue, "
+                        "or no valid rows remain. Upload a new file to enqueue more."
+                    )
+
+    else:
+        st.info("Upload a file above to begin.")
 
 
 # ============================================================
@@ -677,7 +942,8 @@ with tab_queue:
         st.write(
             f"**{len(pending)}** record(s) are waiting. "
             f"Next window will pull up to **{settings['max_sync_per_window']}** (strategy: "
-            f"**{settings.get('scheduling_strategy','fifo').upper()}**)."
+            f"**{settings.get('scheduling_strategy','fifo').upper()}**). "
+            f"The **received_at** column shows when the server accepted each record."
         )
 
         next_n = min(settings["max_sync_per_window"], len(pending))
@@ -724,16 +990,20 @@ with tab_history:
     else:
         ok_cycles = [c for c in engine.sync_cycles if c["status"] == "ok"]
         if ok_cycles:
-            cycles_display = pd.DataFrame(ok_cycles)[
-                ["cycle_number", "timestamp", "fetched", "applied",
-                 "conflicts", "duplicates", "failed", "retried"]
-            ].rename(columns={
+            ok_df_hist = pd.DataFrame(ok_cycles)
+            show_hist = [c for c in
+                ["cycle_number", "window_label", "timestamp", "fetched", "applied",
+                 "conflicts", "duplicates", "expired", "failed", "retried"]
+                if c in ok_df_hist.columns]
+            cycles_display = ok_df_hist[show_hist].rename(columns={
                 "cycle_number": "Cycle",
+                "window_label": "Window",
                 "timestamp": "Ran At (UTC)",
                 "fetched": "Fetched",
                 "applied": "Applied",
                 "conflicts": "Conflicts",
                 "duplicates": "Duplicates",
+                "expired": "Expired",
                 "failed": "Failed",
                 "retried": "Retried",
             })
@@ -915,3 +1185,411 @@ with tab_dlq:
             if "failure_reason" in breakdown.columns:
                 breakdown = breakdown.rename(columns={"failure_reason": "Category", "count": "Count"})
             st.dataframe(breakdown, use_container_width=True, hide_index=True)
+
+
+
+
+
+# ============================================================
+# TAB 7 - Sync Schedule Manager
+# ============================================================
+
+with tab_schedule:
+    st.markdown("### Sync Schedule Manager")
+    st.caption(
+        "Configure the time windows during which the central server is allowed "
+        "to process stock updates. All branches follow this schedule automatically. "
+        "Changes take effect immediately without restarting the application."
+    )
+
+    schedule_cfg = settings.get("sync_schedule", {})
+    enforce = schedule_cfg.get("enforce_window", False)
+    tz_name = schedule_cfg.get("timezone", "UTC")
+    expiry_h = schedule_cfg.get("update_expiry_hours", 48)
+    raw_windows = schedule_cfg.get("windows", [])
+
+    # ---- Live status banner ----
+    live_status = window_checker.get_status()
+    st.divider()
+    st.markdown('<p class="section-title">Current Status</p>', unsafe_allow_html=True)
+
+    status_c1, status_c2, status_c3 = st.columns(3)
+    status_c1.metric(
+        "Enforcement",
+        "ON" if enforce else "OFF",
+    )
+    status_c2.metric("Active Window", live_status.current_window.label if live_status.is_open else "None")
+    status_c3.metric(
+        "Opens In" if not live_status.is_open else "Closes In",
+        live_status.time_until_change_str(),
+    )
+
+    if enforce:
+        if live_status.is_open:
+            st.success(
+                f"Window OPEN: **{live_status.current_window.label}**  |  "
+                f"Closes in {live_status.time_until_change_str()}  |  "
+                f"Timezone: {tz_name}"
+            )
+        else:
+            next_l = live_status.next_window.label if live_status.next_window else "None configured"
+            st.error(
+                f"Window CLOSED  |  "
+                f"Next: **{next_l}**  |  "
+                f"Opens in {live_status.time_until_change_str()}  |  "
+                f"Timezone: {tz_name}"
+            )
+    else:
+        st.info("Enforcement is off. The application processes records at any time.")
+
+    # ---- Global settings ----
+    st.divider()
+    st.markdown('<p class="section-title">Global Settings</p>', unsafe_allow_html=True)
+
+    gs1, gs2, gs3 = st.columns(3)
+
+    with gs1:
+        new_enforce = st.toggle(
+            "Enforce sync windows",
+            value=enforce,
+            help="When ON, the Run Sync Window and Simulate buttons are blocked "
+                 "outside configured windows.",
+        )
+    with gs2:
+        import pytz as _pytz
+        common_tz = [
+            "UTC", "Asia/Kolkata", "Asia/Kolkata", "America/New_York",
+            "America/Los_Angeles", "Europe/London", "Europe/Paris",
+            "Asia/Singapore", "Asia/Tokyo", "Australia/Sydney",
+        ]
+        # Deduplicate while preserving order
+        seen = set()
+        tz_options = [t for t in common_tz if not (t in seen or seen.add(t))]
+        current_idx = tz_options.index(tz_name) if tz_name in tz_options else 0
+        new_tz = st.selectbox(
+            "Schedule timezone",
+            options=tz_options,
+            index=current_idx,
+            help="All window start/end times are interpreted in this timezone.",
+        )
+    with gs3:
+        new_expiry = st.number_input(
+            "Update expiry (hours)",
+            min_value=1,
+            max_value=720,
+            value=int(expiry_h),
+            step=1,
+            help="Updates older than this value are automatically moved to the "
+                 "Dead Letter Queue when a sync window runs.",
+        )
+
+    # ---- Configured windows table ----
+    st.divider()
+    st.markdown('<p class="section-title">Configured Windows</p>', unsafe_allow_html=True)
+    st.caption(
+        "Edit the start and end times for any window directly in the row below. "
+        "Press Save on that row to apply. Remove deletes the window entirely. "
+        "Use Add New Window at the bottom to create additional slots."
+    )
+
+    if not raw_windows:
+        st.info("No windows configured yet. Add one below.")
+    else:
+        import datetime as _dt_inline
+
+        # Column header row
+        h_label, h_start, h_end, h_save, h_remove = st.columns([3, 2, 2, 1, 1])
+        h_label.markdown("**Window Label**")
+        h_start.markdown("**Start (HH:MM)**")
+        h_end.markdown("**End (HH:MM)**")
+
+        st.divider()
+
+        for row_idx, win in enumerate(raw_windows):
+            col_label, col_start, col_end, col_save, col_remove = st.columns([3, 2, 2, 1, 1])
+
+            with col_label:
+                # Label is displayed read-only; rename via remove + re-add
+                st.text_input(
+                    "Label",
+                    value=win.get("label", ""),
+                    key=f"win_label_{row_idx}",
+                    disabled=True,
+                    label_visibility="collapsed",
+                )
+
+            with col_start:
+                edited_start = st.text_input(
+                    "Start",
+                    value=win.get("start", ""),
+                    key=f"win_start_{row_idx}",
+                    placeholder="HH:MM",
+                    label_visibility="collapsed",
+                )
+
+            with col_end:
+                edited_end = st.text_input(
+                    "End",
+                    value=win.get("end", ""),
+                    key=f"win_end_{row_idx}",
+                    placeholder="HH:MM",
+                    label_visibility="collapsed",
+                )
+
+            with col_save:
+                st.write("")
+                if st.button("Save", key=f"win_save_{row_idx}", use_container_width=True):
+                    valid, err = validate_window_entry(win["label"], edited_start, edited_end)
+                    if not valid:
+                        st.error(err)
+                    else:
+                        overlap_found = False
+                        try:
+                            ns = _dt_inline.datetime.strptime(edited_start.strip(), "%H:%M").time()
+                            ne = _dt_inline.datetime.strptime(edited_end.strip(), "%H:%M").time()
+                            for other_idx, other_win in enumerate(raw_windows):
+                                if other_idx == row_idx:
+                                    continue
+                                ws = _dt_inline.datetime.strptime(other_win["start"], "%H:%M").time()
+                                we = _dt_inline.datetime.strptime(other_win["end"], "%H:%M").time()
+                                if ns < we and ne > ws:
+                                    st.error(
+                                        f"Overlaps with '{other_win['label']}' "
+                                        f"({other_win['start']} - {other_win['end']}). "
+                                        "Windows must not overlap."
+                                    )
+                                    overlap_found = True
+                                    break
+                        except Exception:
+                            pass
+
+                        if not overlap_found:
+                            updated_windows = list(raw_windows)
+                            updated_windows[row_idx] = {
+                                "label": win["label"],
+                                "start": edited_start.strip(),
+                                "end": edited_end.strip(),
+                            }
+                            updated_windows.sort(key=lambda x: x["start"])
+                            new_cfg = {
+                                "enforce_window": new_enforce,
+                                "timezone": new_tz,
+                                "update_expiry_hours": new_expiry,
+                                "windows": updated_windows,
+                            }
+                            if save_schedule_config(new_cfg):
+                                settings["sync_schedule"] = new_cfg
+                                st.session_state.settings = settings
+                                st.success(
+                                    f"Saved: {win['label']} updated to "
+                                    f"{edited_start.strip()} - {edited_end.strip()}."
+                                )
+                                st.rerun()
+                            else:
+                                st.error("Could not save changes. Check file permissions.")
+
+            with col_remove:
+                st.write("")
+                if st.button("Remove", key=f"win_remove_{row_idx}", use_container_width=True):
+                    updated_windows = [
+                        w for idx, w in enumerate(raw_windows) if idx != row_idx
+                    ]
+                    new_cfg = {
+                        "enforce_window": new_enforce,
+                        "timezone": new_tz,
+                        "update_expiry_hours": new_expiry,
+                        "windows": updated_windows,
+                    }
+                    if save_schedule_config(new_cfg):
+                        settings["sync_schedule"] = new_cfg
+                        st.session_state.settings = settings
+                        st.success(f"Removed window: {win['label']}")
+                        st.rerun()
+                    else:
+                        st.error("Could not save changes. Check file permissions.")
+
+    # ---- Add new window ----
+    st.divider()
+    st.markdown('<p class="section-title">Add New Window</p>', unsafe_allow_html=True)
+
+    add_c1, add_c2, add_c3, add_c4 = st.columns([3, 2, 2, 2])
+    with add_c1:
+        new_label = st.text_input(
+            "Window name",
+            placeholder="e.g. Morning Sync",
+            help="A descriptive name for this window.",
+        )
+    with add_c2:
+        new_start = st.text_input(
+            "Start time (HH:MM)",
+            placeholder="06:00",
+        )
+    with add_c3:
+        new_end = st.text_input(
+            "End time (HH:MM)",
+            placeholder="08:00",
+        )
+    with add_c4:
+        st.write("")
+        st.write("")
+        add_clicked = st.button("Add Window", type="primary", use_container_width=True)
+
+    if add_clicked:
+        valid, err = validate_window_entry(new_label, new_start, new_end)
+        if not valid:
+            st.error(err)
+        else:
+            # Check for overlap with existing windows
+            overlap = False
+            import datetime as _dt
+            try:
+                ns = _dt.datetime.strptime(new_start.strip(), "%H:%M").time()
+                ne = _dt.datetime.strptime(new_end.strip(), "%H:%M").time()
+                for w in raw_windows:
+                    ws = _dt.datetime.strptime(w["start"], "%H:%M").time()
+                    we = _dt.datetime.strptime(w["end"], "%H:%M").time()
+                    if ns < we and ne > ws:
+                        overlap = True
+                        st.error(
+                            f"This window overlaps with '{w['label']}' "
+                            f"({w['start']} - {w['end']}). "
+                            "Windows must not overlap."
+                        )
+                        break
+            except Exception:
+                pass
+
+            if not overlap:
+                updated_windows = raw_windows + [
+                    {"label": new_label.strip(), "start": new_start.strip(), "end": new_end.strip()}
+                ]
+                # Sort by start time
+                updated_windows.sort(key=lambda w: w["start"])
+                new_cfg = {
+                    "enforce_window": new_enforce,
+                    "timezone": new_tz,
+                    "update_expiry_hours": new_expiry,
+                    "windows": updated_windows,
+                }
+                if save_schedule_config(new_cfg):
+                    settings["sync_schedule"] = new_cfg
+                    st.session_state.settings = settings
+                    st.success(
+                        f"Added window: {new_label} ({new_start} - {new_end}). "
+                        "Changes are live immediately."
+                    )
+                    st.rerun()
+                else:
+                    st.error("Could not save to settings.json. Check file permissions.")
+
+    # ---- Save global settings (enforce / tz / expiry) ----
+    st.divider()
+    if st.button("Save Global Settings", type="secondary", use_container_width=False):
+        new_cfg = {
+            "enforce_window": new_enforce,
+            "timezone": new_tz,
+            "update_expiry_hours": new_expiry,
+            "windows": raw_windows,
+        }
+        if save_schedule_config(new_cfg):
+            settings["sync_schedule"] = new_cfg
+            st.session_state.settings = settings
+            st.success("Global settings saved. Changes are live immediately.")
+            st.rerun()
+        else:
+            st.error("Could not save to settings.json. Check file permissions.")
+
+    # ---- 24-hour timeline visualisation ----
+    st.divider()
+    st.markdown('<p class="section-title">24-Hour Timeline</p>', unsafe_allow_html=True)
+    st.caption(
+        "Grey = closed. Coloured bars = sync windows. "
+        "Red line = current time in the configured timezone."
+    )
+
+    if not raw_windows:
+        st.info("Add windows above to see the timeline.")
+    else:
+        import plotly.graph_objects as _go2
+
+        timeline = _go2.Figure()
+
+        # Full-day background bar
+        timeline.add_trace(_go2.Bar(
+            x=[24 * 60],
+            y=["Schedule"],
+            orientation="h",
+            marker_color="rgba(255,255,255,0.08)",
+            width=0.4,
+            base=0,
+            showlegend=False,
+            hoverinfo="skip",
+        ))
+
+        colours = ["#1565c0", "#0e7c61", "#8e24aa", "#c62828", "#e65100", "#00695c"]
+        for idx, w in enumerate(raw_windows):
+            try:
+                import datetime as _dt2
+                ws = _dt2.datetime.strptime(w["start"], "%H:%M")
+                we = _dt2.datetime.strptime(w["end"], "%H:%M")
+                s_min = ws.hour * 60 + ws.minute
+                dur = (we.hour * 60 + we.minute) - s_min
+                col = colours[idx % len(colours)]
+                timeline.add_trace(_go2.Bar(
+                    x=[dur],
+                    y=["Schedule"],
+                    orientation="h",
+                    marker_color=col,
+                    width=0.4,
+                    base=s_min,
+                    name=w.get("label", f"Window {idx+1}"),
+                    hovertemplate=f"{w.get('label', '')}:<br>{w['start']} - {w['end']}<extra></extra>",
+                ))
+            except Exception:
+                continue
+
+        # Current time marker
+        import pytz as _pytz2
+        import datetime as _dt3
+        tz_obj = _pytz2.timezone(tz_name) if tz_name in _pytz2.all_timezones else _pytz2.UTC
+        now_local = _dt3.datetime.now(tz=tz_obj)
+        now_min = now_local.hour * 60 + now_local.minute
+
+        timeline.add_vline(
+            x=now_min,
+            line_width=2,
+            line_color="#ef5350",
+            annotation_text=f"Now ({now_local.strftime('%H:%M')} {tz_name})",
+            annotation_position="top right",
+            annotation_font_color="#ef5350",
+        )
+
+        # X-axis: hours
+        tick_vals = list(range(0, 24 * 60 + 1, 60))
+        tick_text = [f"{h:02d}:00" for h in range(25)]
+
+        timeline.update_layout(
+            barmode="overlay",
+            height=140,
+            xaxis=dict(
+                tickvals=tick_vals,
+                ticktext=tick_text,
+                range=[0, 24 * 60],
+                color="#c8d6e5",
+                showgrid=False,
+            ),
+            yaxis=dict(showticklabels=False, showgrid=False),
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+            margin=dict(t=30, b=30, l=10, r=10),
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.1,
+                xanchor="left",
+                x=0,
+                font=dict(color="#c8d6e5"),
+            ),
+            font=dict(color="#c8d6e5"),
+        )
+        st.plotly_chart(timeline, use_container_width=True)

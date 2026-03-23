@@ -5,17 +5,27 @@ Data validation and normalisation pipeline.
 
 Responsibilities:
   1. Verify all required standard columns are present.
-  2. Convert data types safely (quantity to int, timestamp to UTC).
-  3. Normalize timestamps to UTC regardless of source timezone.
-  4. Drop or flag rows that cannot be repaired.
-  5. Auto-generate update_id for rows that lack one.
+     Required: store_id, product, quantity
+     Optional: timestamp, update_id
 
-Timezone handling (requirement 17):
-  - All timestamps are converted to timezone-aware UTC Timestamps.
-  - Naive timestamps are localised to settings["default_timezone"] first.
-  - Numeric Unix timestamps (seconds or milliseconds) are also supported.
-  - Rows whose timestamp cannot be parsed at all are dropped and logged.
-  - No naive datetime objects are stored after this stage.
+  2. Convert data types safely.
+
+  3. If timestamp is present, normalise it to UTC regardless of source
+     timezone. If timestamp is absent, the column is simply omitted —
+     the server will stamp received_at at enqueue time (see scheduler.py).
+     This separates the branch's internal recording time from the server's
+     receipt time, which is the architecturally correct design.
+
+  4. Auto-generate update_id for rows that lack one.
+
+  5. Drop rows that cannot be repaired and report them with clear messages.
+
+Timezone handling:
+  - Timezone-aware strings (+05:30, Z, etc.) are converted directly to UTC.
+  - Naive strings are localised to default_timezone then converted to UTC.
+  - Unix epoch values (seconds or milliseconds) are supported.
+  - Rows with completely unparseable timestamps are dropped and logged.
+  - No naive datetime objects survive past this stage.
 """
 
 import uuid
@@ -25,14 +35,10 @@ import pandas as pd
 
 from core.logger import get_logger
 
-REQUIRED_COLUMNS = {"store_id", "product", "quantity", "timestamp"}
-OPTIONAL_COLUMNS = {"update_id"}
+# timestamp is now optional — the server stamps received_at at enqueue time
+REQUIRED_COLUMNS = {"store_id", "product", "quantity"}
+OPTIONAL_COLUMNS = {"timestamp", "update_id"}
 ALL_STANDARD_COLUMNS = REQUIRED_COLUMNS | OPTIONAL_COLUMNS
-
-
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
 
 
 def validate_and_normalize(
@@ -43,11 +49,17 @@ def validate_and_normalize(
     """
     Validate and normalise a DataFrame that already has standard column names.
 
+    Parameters
+    ----------
+    df               : DataFrame with columns mapped to the standard schema.
+    default_timezone : Timezone assumed for naive timestamps.
+    logger           : Optional logger instance.
+
     Returns
     -------
     (clean_df, warnings)
-    clean_df  : rows that passed all checks, with corrected types
-    warnings  : human-readable list of issues found (empty = no problems)
+    clean_df : Rows that passed all checks, with corrected types.
+    warnings : Human-readable list of issues found. Empty means no problems.
     """
     if logger is None:
         logger = get_logger()
@@ -60,19 +72,20 @@ def validate_and_normalize(
     if missing:
         raise ValueError(
             f"Required columns missing after schema mapping: {sorted(missing)}. "
-            "Check schema_mapping.json or upload a file with matching column names."
+            "Each upload must contain at minimum: store_id, product, quantity."
         )
 
     df = df.copy()
 
-    # 1. Auto-generate update_id for rows that lack one
+    # ------------------------------------------------------------------
+    # update_id: auto-generate if absent or empty
+    # ------------------------------------------------------------------
     if "update_id" not in df.columns:
         df["update_id"] = [str(uuid.uuid4()) for _ in range(len(df))]
         warnings.append(
             "Column 'update_id' was absent. Unique IDs were generated automatically."
         )
     else:
-        # Fill empty / NaN update_ids with generated values
         df["update_id"] = df["update_id"].astype(str).str.strip()
         needs_id = (df["update_id"] == "") | (df["update_id"].str.lower() == "nan")
         if needs_id.any():
@@ -80,10 +93,12 @@ def validate_and_normalize(
                 str(uuid.uuid4()) for _ in range(needs_id.sum())
             ]
             warnings.append(
-                f"{needs_id.sum()} row(s) had empty update_id; values were generated."
+                f"{needs_id.sum()} row(s) had empty update_id — values generated."
             )
 
-    # 2. Validate store_id and product
+    # ------------------------------------------------------------------
+    # store_id and product: must be non-empty strings
+    # ------------------------------------------------------------------
     for col in ("store_id", "product"):
         df[col] = df[col].astype(str).str.strip()
         bad = (df[col] == "") | (df[col].str.lower() == "nan")
@@ -94,7 +109,9 @@ def validate_and_normalize(
             logger.warning(f"Dropping {bad.sum()} rows: empty '{col}'.")
         df = df[~bad]
 
-    # 3. Validate quantity
+    # ------------------------------------------------------------------
+    # quantity: must be a non-negative integer
+    # ------------------------------------------------------------------
     df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce")
     bad_qty = df["quantity"].isna()
     if bad_qty.any():
@@ -107,17 +124,31 @@ def validate_and_normalize(
     negative = df["quantity"] < 0
     if negative.any():
         warnings.append(
-            f"{negative.sum()} row(s) have negative quantity (kept - may represent returns)."
+            f"{negative.sum()} row(s) have negative quantity "
+            "(kept — may represent returns or adjustments)."
         )
 
     df["quantity"] = df["quantity"].astype(int)
 
-    # 4. Normalise timestamps to UTC
-    df, ts_warnings = _normalize_timestamps(df, default_timezone, logger)
-    warnings.extend(ts_warnings)
-    df = df.dropna(subset=["timestamp"])
+    # ------------------------------------------------------------------
+    # timestamp: optional. If present, normalise to UTC.
+    # If absent, the column is simply not included — scheduler.py will
+    # stamp received_at when the record enters the queue.
+    # ------------------------------------------------------------------
+    if "timestamp" in df.columns:
+        df, ts_warnings = _normalize_timestamps(df, default_timezone, logger)
+        warnings.extend(ts_warnings)
+        # Rows with completely unparseable timestamps are dropped
+        df = df.dropna(subset=["timestamp"])
+    else:
+        warnings.append(
+            "Column 'timestamp' was not provided. "
+            "The server will record the upload time as the effective timestamp."
+        )
 
-    # 5. Keep only standard columns, in defined order
+    # ------------------------------------------------------------------
+    # Keep only standard columns in a defined order
+    # ------------------------------------------------------------------
     col_order = [c for c in ALL_STANDARD_COLUMNS if c in df.columns]
     df = df[col_order].reset_index(drop=True)
 
@@ -137,7 +168,6 @@ def validate_and_normalize(
 # Timestamp normalisation
 # ---------------------------------------------------------------------------
 
-
 def _normalize_timestamps(
     df: pd.DataFrame,
     default_tz: str,
@@ -146,11 +176,11 @@ def _normalize_timestamps(
     """
     Convert every value in df["timestamp"] to a UTC-aware pandas Timestamp.
 
-    Strategy per row:
-      1. If the value is already a tz-aware Timestamp, convert to UTC.
-      2. If it is a tz-naive Timestamp or string, localise to default_tz then UTC.
-      3. If it looks like a number, treat as Unix epoch (auto-detect s vs ms).
-      4. If none of the above work, set to NaT (the row will be dropped).
+    Strategy per value:
+      1. Already tz-aware  -> convert to UTC directly.
+      2. Tz-naive or string -> localise to default_tz then convert to UTC.
+      3. Numeric            -> treat as Unix epoch (auto-detect s vs ms).
+      4. Unparseable        -> set NaT (row will be dropped).
     """
     warnings: List[str] = []
 
@@ -163,21 +193,17 @@ def _normalize_timestamps(
         warnings.append(
             f"{n_failed} row(s) had unparseable timestamps and will be dropped."
         )
-        logger.warning(f"{n_failed} rows will be dropped due to invalid timestamps.")
+        logger.warning(f"{n_failed} rows will be dropped: invalid timestamps.")
 
     df["timestamp"] = result
     return df, warnings
 
 
 def _parse_single_timestamp(value, default_tz: str):
-    """
-    Parse one timestamp value to a UTC-aware pandas Timestamp.
-    Returns pd.NaT on failure.
-    """
+    """Return a UTC-aware pandas Timestamp, or pd.NaT on failure."""
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return pd.NaT
 
-    # Already a Timestamp
     if isinstance(value, pd.Timestamp):
         try:
             if value.tzinfo is None:
@@ -190,12 +216,12 @@ def _parse_single_timestamp(value, default_tz: str):
     try:
         num = float(value)
         if num > 1e12:
-            num = num / 1000.0  # milliseconds
+            num /= 1000.0
         return pd.Timestamp(num, unit="s", tz="UTC")
     except (ValueError, TypeError, OverflowError):
         pass
 
-    # String / object: parse then localise
+    # String or object
     try:
         parsed = pd.Timestamp(value)
         if parsed.tzinfo is None:

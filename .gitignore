@@ -32,6 +32,8 @@ data/*.json
 !data/sample.json
 data/*.csv
 !data/sample.csv
+!data/sample_dlq_demo.csv
+!data/sample_dlq_demo.json
 data/*.xlsx
 !data/sample.xlsx
 
