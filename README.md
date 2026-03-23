@@ -1,5 +1,7 @@
 # Pharmacy Smart Sync Scheduler
 
+![Sync History and Audit Log](assets/sync_history.png)
+
 A queue-based stock synchronisation system for multi-branch pharmacy networks. Branches upload stock update files during allocated sync windows. The central server validates, deduplicates, resolves conflicts, and writes a clean authoritative stock database — all without requiring any branch to maintain a persistent connection.
 
 ---
@@ -260,6 +262,8 @@ Out-of-order detection runs after conflict resolution. If an incoming record's t
 ---
 
 ## Sync Windows and Scheduling
+
+![Sync Schedule Configuration](assets/sync_schedule.png)
 
 The Sync Schedule tab provides full control over when the server accepts processing.
 
