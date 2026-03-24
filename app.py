@@ -697,6 +697,57 @@ with tab_dashboard:
 
     st.divider()
 
+    # Window status banner
+    wstatus = window_checker.get_status()
+    enforce = settings.get("sync_schedule", {}).get("enforce_window", False)
+    override = st.session_state.get("emergency_override", False)
+
+    if not enforce:
+        st.info(
+            "Window enforcement is OFF. Processing is allowed at any time. "
+            "Configure windows in the Sync Schedule tab."
+        )
+    elif wstatus.is_open:
+        st.success(
+            f"Window OPEN: **{wstatus.current_window.label}**   |   "
+            f"Closes in **{wstatus.time_until_change_str()}**"
+        )
+    elif override:
+        st.warning(
+            "Emergency override is active. Processing bypasses the schedule. "
+            "Disable it below once done."
+        )
+    else:
+        next_label = wstatus.next_window.label if wstatus.next_window else "None"
+        st.error(
+            f"Window CLOSED   |   "
+            f"Next: **{next_label}**   |   "
+            f"Opens in **{wstatus.time_until_change_str()}**"
+        )
+
+    # Emergency override toggle (only shown when enforcement is on and window closed)
+    if enforce and not wstatus.is_open:
+        ov_col, _ = st.columns([2, 5])
+        with ov_col:
+            if override:
+                if st.button("Disable Emergency Override", use_container_width=True):
+                    st.session_state.emergency_override = False
+                    st.rerun()
+            else:
+                if st.button(
+                    "Emergency Override",
+                    use_container_width=True,
+                    help="Force processing outside the configured sync window. Use only for urgent situations.",
+                ):
+                    st.session_state.emergency_override = True
+                    st.rerun()
+
+    st.divider()
+
+    # Determine if processing is allowed right now
+    allowed, allow_reason = window_checker.processing_allowed(override=override)
+    processing_blocked = scheduler.is_empty() or not allowed
+
     # Run sync window button
     btn_col, info_col = st.columns([2, 5])
 
@@ -705,28 +756,39 @@ with tab_dashboard:
             "Run Sync Window",
             type="primary",
             use_container_width=True,
-            disabled=scheduler.is_empty(),
+            disabled=processing_blocked,
         )
     with info_col:
         if scheduler.is_empty():
             st.info("Queue is empty. Upload a file and add records to the queue first.")
+        elif not allowed:
+            st.warning(allow_reason)
         else:
             preview_n = min(scheduler.queue_size(), settings["max_sync_per_window"])
+            current_win = wstatus.current_window.label if wstatus.current_window else "Override"
             st.write(
                 f"Next window will process up to **{preview_n}** record(s) "
-                f"({scheduler.queue_size()} remaining in queue)."
+                f"({scheduler.queue_size()} remaining in queue).  "
+                f"Window: **{current_win}**"
             )
 
-    if run_clicked:
+    if run_clicked and allowed:
+        current_label = (
+            wstatus.current_window.label if wstatus.current_window else "Emergency Override"
+        )
         with st.spinner("Running sync window..."):
-            result = engine.run_sync_window()
+            result = engine.run_sync_window(
+                window_label=current_label,
+                window_checker=window_checker,
+            )
         if result["status"] == "empty":
             st.warning("Queue was empty when the window ran.")
         else:
             st.success(
-                f"Cycle {result['cycle_number']} complete: "
+                f"Cycle {result['cycle_number']} [{current_label}] complete: "
                 f"applied {result['applied']}, "
                 f"conflicts dropped {result['conflicts']}, "
+                f"expired {result.get('expired', 0)}, "
                 f"failed {result['failed']}, "
                 f"retried {result['retried']}."
             )
@@ -865,15 +927,25 @@ with tab_dashboard:
             f"Simulate {sim_count} Cycle(s)",
             type="secondary",
             use_container_width=True,
-            disabled=scheduler.is_empty(),
+            disabled=processing_blocked,
         ):
+            if not allowed:
+                st.warning(allow_reason)
+                st.stop()
             retries_before = engine.metrics["total_retries"]
             completed = 0
             with st.spinner(f"Running {sim_count} sync cycle(s)..."):
                 for _ in range(int(sim_count)):
                     if scheduler.is_empty():
                         break
-                    engine.run_sync_window()
+                    _sim_label = (
+                        wstatus.current_window.label
+                        if wstatus.current_window else "Emergency Override"
+                    )
+                    engine.run_sync_window(
+                        window_label=_sim_label,
+                        window_checker=window_checker,
+                    )
                     completed += 1
 
             retries_added = engine.metrics["total_retries"] - retries_before
@@ -902,7 +974,7 @@ with tab_dashboard:
             "Run Until Empty",
             type="primary",
             use_container_width=True,
-            disabled=scheduler.is_empty(),
+            disabled=processing_blocked,
             help="Keeps running sync windows until the queue is completely empty, "
                  "including all retry attempts.",
         ):
@@ -910,7 +982,14 @@ with tab_dashboard:
             MAX_SAFETY = 500  # prevent infinite loop if retry_limit is very high
             with st.spinner("Running until queue is empty..."):
                 while not scheduler.is_empty() and completed_all < MAX_SAFETY:
-                    engine.run_sync_window()
+                    _ue_label = (
+                        wstatus.current_window.label
+                        if wstatus.current_window else "Emergency Override"
+                    )
+                    engine.run_sync_window(
+                        window_label=_ue_label,
+                        window_checker=window_checker,
+                    )
                     completed_all += 1
 
             dlq_count = len(engine.retry_handler.get_dead_letter_queue())
